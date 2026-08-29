@@ -1,0 +1,15 @@
+/**:
+    ros__parameters:
+        input_topic: "/fmu/out/sensor_combined"
+        timesync_topic: "/fmu/out/timesync_status"
+        output_topic: "/px4/imu_fastlio"
+        frame_id: "px4_imu_flu"
+        require_synced_time: true
+        drop_clipped: true
+        max_time_error_ms: 50.0
+        # Report scheduling or transport gaps without replacing PX4 sample time.
+        max_timestamp_gap_ms: 30.0
+        # PX4 SensorCombined is FRD. FAST-LIO's ROS IMU convention here is FLU.
+        rotation_px4_to_imu: [1.,  0.,  0.,
+                              0., -1.,  0.,
+                              0.,  0., -1.]

@@ -1,0 +1,59 @@
+/**:
+    ros__parameters:
+        feature_extract_enable: false
+        point_filter_num: 1
+        max_iteration: 3
+        filter_size_surf: 0.5
+        filter_size_map: 0.5
+        cube_side_length: 1000.0
+        runtime_pos_log_enable: false
+        map_file_path: "./test.pcd"
+
+        common:
+            lid_topic: "/livox/lidar"
+            imu_topic: "/px4/imu_fastlio"
+            time_sync_en: false
+            # Paired angular-rate calibration: PX4 samples lead Livox by 1.49 ms.
+            # FAST-LIO subtracts this parameter from the incoming IMU stamp.
+            time_offset_lidar_to_imu: -0.00149
+
+        preprocess:
+            lidar_type: 1
+            scan_line: 4
+            blind: 0.15
+            timestamp_unit: 3
+            scan_rate: 10
+
+        mapping:
+            acc_cov: 0.1
+            gyr_cov: 0.1
+            b_acc_cov: 0.0001
+            b_gyr_cov: 0.0001
+            fov_degree: 360.0
+            det_range: 100.0
+            extrinsic_est_en: false
+            # Zero is only a bring-up placeholder. Replace it with the measured
+            # translation from PX4 IMU to LiDAR before any flight test.
+            extrinsic_T: [-0.025, 0., 0.10]
+            # Calibrated from flight_logs/px4_lidar_extrinsic using paired
+            # Livox/PX4 angular rates. Maps LiDAR axes into PX4 IMU FLU axes.
+            extrinsic_R: [ 0.99789986,  0.00223419, -0.06473702,
+                          -0.00302289,  0.99992237, -0.01208777,
+                           0.06470499,  0.01225808,  0.99782915]
+            # extrinsic_R: [ 1., 0., 0.,
+            #                 0., 1., 0.,
+            #                 0., 0., 1.]
+
+        publish:
+            path_en: false
+            effect_map_en: false
+            map_en: false
+            scan_publish_en: false
+            dense_publish_en: false
+            scan_bodyframe_pub_en: false
+            imu_odom_en: true
+            imu_odom_topic: "/Odometry_imu"
+
+        pcd_save:
+            pcd_save_en: false
+            interval: -1

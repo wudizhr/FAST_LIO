@@ -143,6 +143,205 @@ geometry_msgs::msg::PoseStamped msg_body_pose;
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
 
+class RealtimeImuOdometry
+{
+public:
+    using Filter = esekfom::esekf<state_ikfom, 12, input_ikfom>;
+    using ImuMsg = sensor_msgs::msg::Imu;
+
+    RealtimeImuOdometry()
+    {
+        double limits[23];
+        std::fill(std::begin(limits), std::end(limits), 0.001);
+        filter_.init_dyn_runtime_share(get_f, df_dx, df_dw, 1, limits);
+    }
+
+    void configure(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr &publisher)
+    {
+        publisher_ = publisher;
+    }
+
+    void addImu(const ImuMsg::SharedPtr &imu)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const double stamp = get_time_sec(imu->header.stamp);
+        if (!history_.empty() && stamp <= get_time_sec(history_.back()->header.stamp))
+        {
+            history_.clear();
+            last_imu_.reset();
+            ready_ = false;
+        }
+
+        history_.push_back(imu);
+        trimHistory(stamp - history_duration_);
+
+        if (!ready_ || !publisher_ || stamp <= state_time_)
+        {
+            return;
+        }
+
+        propagateTo(imu);
+        publish(imu->header.stamp);
+    }
+
+    void correct(const Filter &corrected_filter, double correction_time)
+    {
+        if (!p_imu->initialized())
+        {
+            return;
+        }
+
+        std::deque<ImuMsg::SharedPtr> history_snapshot;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            history_snapshot = history_;
+        }
+
+        Filter corrected_prediction;
+        double limits[23];
+        std::fill(std::begin(limits), std::end(limits), 0.001);
+        corrected_prediction.init_dyn_runtime_share(get_f, df_dx, df_dw, 1, limits);
+        state_ikfom corrected_state = corrected_filter.get_x();
+        Filter::cov corrected_covariance = corrected_filter.get_P();
+        corrected_prediction.change_x(corrected_state);
+        corrected_prediction.change_P(corrected_covariance);
+        double corrected_time = correction_time;
+        ImuMsg::SharedPtr corrected_last_imu;
+        input_ikfom corrected_last_input;
+
+        // Repropagate measurements received while the lidar frame was being
+        // processed. This runs without blocking the realtime publisher.
+        for (const auto &imu : history_snapshot)
+        {
+            const double stamp = get_time_sec(imu->header.stamp);
+            if (stamp <= correction_time)
+            {
+                corrected_last_imu = imu;
+                continue;
+            }
+            propagateFilter(corrected_prediction, corrected_time, corrected_last_imu,
+                            corrected_last_input, imu);
+        }
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        // Only the IMUs that arrived during the unlocked replay remain here.
+        for (const auto &imu : history_)
+        {
+            if (get_time_sec(imu->header.stamp) > corrected_time)
+            {
+                propagateFilter(corrected_prediction, corrected_time, corrected_last_imu,
+                                corrected_last_input, imu);
+            }
+        }
+        state_ikfom prediction_state = corrected_prediction.get_x();
+        Filter::cov prediction_covariance = corrected_prediction.get_P();
+        filter_.change_x(prediction_state);
+        filter_.change_P(prediction_covariance);
+        state_time_ = corrected_time;
+        last_imu_ = corrected_last_imu;
+        last_input_ = corrected_last_input;
+        ready_ = true;
+    }
+
+private:
+    void propagateTo(const ImuMsg::SharedPtr &tail)
+    {
+        propagateFilter(filter_, state_time_, last_imu_, last_input_, tail);
+    }
+
+    static void propagateFilter(Filter &filter, double &state_time,
+                                ImuMsg::SharedPtr &last_imu, input_ikfom &last_input,
+                                const ImuMsg::SharedPtr &tail)
+    {
+        const double tail_time = get_time_sec(tail->header.stamp);
+        double dt = tail_time - state_time;
+        if (dt <= 0.0 || dt > 0.2)
+        {
+            last_imu = tail;
+            state_time = tail_time;
+            return;
+        }
+
+        const auto &head = last_imu ? last_imu : tail;
+        input_ikfom input;
+        input.gyro << 0.5 * (head->angular_velocity.x + tail->angular_velocity.x),
+                      0.5 * (head->angular_velocity.y + tail->angular_velocity.y),
+                      0.5 * (head->angular_velocity.z + tail->angular_velocity.z);
+        input.acc << 0.5 * (head->linear_acceleration.x + tail->linear_acceleration.x),
+                     0.5 * (head->linear_acceleration.y + tail->linear_acceleration.y),
+                     0.5 * (head->linear_acceleration.z + tail->linear_acceleration.z);
+        input.acc *= p_imu->acceleration_scale();
+
+        auto process_noise = process_noise_cov();
+        process_noise.block<3, 3>(0, 0).diagonal() = p_imu->cov_gyr;
+        process_noise.block<3, 3>(3, 3).diagonal() = p_imu->cov_acc;
+        process_noise.block<3, 3>(6, 6).diagonal() = p_imu->cov_bias_gyr;
+        process_noise.block<3, 3>(9, 9).diagonal() = p_imu->cov_bias_acc;
+        filter.predict(dt, process_noise, input);
+
+        last_input = input;
+        last_imu = tail;
+        state_time = tail_time;
+    }
+
+    void publish(const builtin_interfaces::msg::Time &stamp)
+    {
+        const state_ikfom state = filter_.get_x();
+        const Filter::cov covariance = filter_.get_P();
+        nav_msgs::msg::Odometry odom;
+        odom.header.stamp = stamp;
+        odom.header.frame_id = "camera_init";
+        odom.child_frame_id = "body";
+        odom.pose.pose.position.x = state.pos(0);
+        odom.pose.pose.position.y = state.pos(1);
+        odom.pose.pose.position.z = state.pos(2);
+        odom.pose.pose.orientation.x = state.rot.coeffs()[0];
+        odom.pose.pose.orientation.y = state.rot.coeffs()[1];
+        odom.pose.pose.orientation.z = state.rot.coeffs()[2];
+        odom.pose.pose.orientation.w = state.rot.coeffs()[3];
+
+        const V3D velocity_body = state.rot.conjugate() * state.vel;
+        odom.twist.twist.linear.x = velocity_body(0);
+        odom.twist.twist.linear.y = velocity_body(1);
+        odom.twist.twist.linear.z = velocity_body(2);
+        const V3D angular_velocity = last_input_.gyro - state.bg;
+        odom.twist.twist.angular.x = angular_velocity(0);
+        odom.twist.twist.angular.y = angular_velocity(1);
+        odom.twist.twist.angular.z = angular_velocity(2);
+
+        for (int i = 0; i < 6; ++i)
+        {
+            const int state_index = i < 3 ? i + 3 : i - 3;
+            for (int j = 0; j < 6; ++j)
+            {
+                const int covariance_index = j < 3 ? j + 3 : j - 3;
+                odom.pose.covariance[i * 6 + j] = covariance(state_index, covariance_index);
+            }
+        }
+        publisher_->publish(odom);
+    }
+
+    void trimHistory(double oldest_time)
+    {
+        while (history_.size() > 2 && get_time_sec(history_[1]->header.stamp) < oldest_time)
+        {
+            history_.pop_front();
+        }
+    }
+
+    Filter filter_;
+    input_ikfom last_input_;
+    std::deque<ImuMsg::SharedPtr> history_;
+    ImuMsg::SharedPtr last_imu_;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr publisher_;
+    std::mutex mutex_;
+    double state_time_ = -1.0;
+    const double history_duration_ = 2.0;
+    bool ready_ = false;
+};
+
+std::unique_ptr<RealtimeImuOdometry> realtime_imu_odometry;
+
 void SigHandle(int sig)
 {
     flg_exit = true;
@@ -375,6 +574,10 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 
     imu_buffer.push_back(msg);
     mtx_buffer.unlock();
+    if (realtime_imu_odometry)
+    {
+        realtime_imu_odometry->addImu(msg);
+    }
     sig_buffer.notify_all();
 }
 
@@ -382,6 +585,7 @@ double lidar_mean_scantime = 0.0;
 int    scan_num = 0;
 bool sync_packages(MeasureGroup &meas)
 {
+    std::lock_guard<std::mutex> lock(mtx_buffer);
     if (lidar_buffer.empty() || imu_buffer.empty()) {
         return false;
     }
@@ -804,6 +1008,8 @@ public:
         this->declare_parameter<bool>("publish.scan_publish_en", true);
         this->declare_parameter<bool>("publish.dense_publish_en", true);
         this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
+        this->declare_parameter<bool>("publish.imu_odom_en", true);
+        this->declare_parameter<string>("publish.imu_odom_topic", "/Odometry_imu");
         this->declare_parameter<int>("max_iteration", 4);
         this->declare_parameter<string>("map_file_path", "");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
@@ -840,6 +1046,10 @@ public:
         this->get_parameter_or<bool>("publish.scan_publish_en", scan_pub_en, true);
         this->get_parameter_or<bool>("publish.dense_publish_en", dense_pub_en, true);
         this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
+        bool imu_odom_en = true;
+        string imu_odom_topic = "/Odometry_imu";
+        this->get_parameter_or<bool>("publish.imu_odom_en", imu_odom_en, true);
+        this->get_parameter_or<string>("publish.imu_odom_topic", imu_odom_topic, "/Odometry_imu");
         this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
         this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
@@ -918,6 +1128,10 @@ public:
             cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
 
         /*** ROS subscribe initialization ***/
+        imu_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        rclcpp::SubscriptionOptions imu_subscription_options;
+        imu_subscription_options.callback_group = imu_callback_group_;
+
         if (p_pre->lidar_type == AVIA)
         {
             sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 20, livox_pcl_cbk);
@@ -926,12 +1140,19 @@ public:
         {
             sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
         }
-        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
+        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(
+            imu_topic, 10, imu_cbk, imu_subscription_options);
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
         pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
+        if (imu_odom_en)
+        {
+            pubImuOdometry_ = this->create_publisher<nav_msgs::msg::Odometry>(imu_odom_topic, 100);
+            realtime_imu_odometry = std::make_unique<RealtimeImuOdometry>();
+            realtime_imu_odometry->configure(pubImuOdometry_);
+        }
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
@@ -949,6 +1170,7 @@ public:
 
     ~LaserMappingNode()
     {
+        realtime_imu_odometry.reset();
         fout_out.close();
         fout_pre.close();
         fclose(fp);
@@ -1062,6 +1284,10 @@ private:
 
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+            if (realtime_imu_odometry)
+            {
+                realtime_imu_odometry->correct(kf, lidar_end_time);
+            }
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
@@ -1134,10 +1360,12 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubImuOdometry_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
+    rclcpp::CallbackGroup::SharedPtr imu_callback_group_;
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     rclcpp::TimerBase::SharedPtr timer_;
@@ -1160,7 +1388,10 @@ int main(int argc, char** argv)
 
     signal(SIGINT, SigHandle);
 
-    rclcpp::spin(std::make_shared<LaserMappingNode>());
+    auto node = std::make_shared<LaserMappingNode>();
+    rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 2);
+    executor.add_node(node);
+    executor.spin();
 
     if (rclcpp::ok())
         rclcpp::shutdown();
