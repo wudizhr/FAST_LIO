@@ -836,6 +836,16 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     odomAftMapped.child_frame_id = body_frame;
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
+    // Linear velocity in the WORLD frame, matching the convention of the
+    // ekf_pose node used by the faster_lio backend (the only path in this
+    // stack that previously published a valid twist): ego_planner
+    // (planGlobalTraj) treats this as a world-frame start velocity and
+    // lio_to_px4 uses its norm for the speed/acceleration safety checks.
+    // The angular twist is deliberately left at zero: no consumer in this
+    // stack reads it, and the ekf_pose reference does not fill it either.
+    odomAftMapped.twist.twist.linear.x = state_point.vel(0);
+    odomAftMapped.twist.twist.linear.y = state_point.vel(1);
+    odomAftMapped.twist.twist.linear.z = state_point.vel(2);
     pubOdomAftMapped->publish(odomAftMapped);
     auto P = kf.get_P();
     for (int i = 0; i < 6; i ++)
