@@ -34,21 +34,21 @@
             extrinsic_est_en: false
             # Zero is only a bring-up placeholder. Replace it with the measured
             # translation from PX4 IMU to LiDAR before any flight test.
-            extrinsic_T: [-0.025, 0., 0.10]
+            extrinsic_T: [0.075, 0., 0.05]
             # Calibrated from flight_logs/px4_lidar_extrinsic using paired
             # Livox/PX4 angular rates. Maps LiDAR axes into PX4 IMU FLU axes.
-            extrinsic_R: [ 0.99789986,  0.00223419, -0.06473702,
-                          -0.00302289,  0.99992237, -0.01208777,
-                           0.06470499,  0.01225808,  0.99782915]
-            # extrinsic_R: [ 1., 0., 0.,
-            #                 0., 1., 0.,
-            #                 0., 0., 1.]
+            # extrinsic_R: [ 0.99789986,  0.00223419, -0.06473702,
+            #               -0.00302289,  0.99992237, -0.01208777,
+            #                0.06470499,  0.01225808,  0.99782915]
+            extrinsic_R: [ 1., 0., 0.,
+                            0., 1., 0.,
+                            0., 0., 1.]
 
         publish:
             path_en: false
             effect_map_en: false
             map_en: false
-            scan_publish_en: false
+            scan_publish_en: true
             dense_publish_en: false
             scan_bodyframe_pub_en: false
             imu_odom_en: true
